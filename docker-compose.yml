@@ -1,0 +1,84 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_USER: shieldstream
+      POSTGRES_PASSWORD: localdev_only
+      POSTGRES_DB: shieldstream
+    ports: ["5432:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shieldstream"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Local trace backend — OTLP-native, so the gateway's exporter config never
+  # changes between this and AWS X-Ray later (Week 10 decision).
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317" # OTLP gRPC receiver
+
+  # Trivial echo server standing in for a real downstream service (Week 3).
+  httpbin:
+    image: kennethreitz/httpbin
+    ports: ["9000:80"]
+
+  gateway:
+    # network: host on the build (not the running container) works around this
+    # machine's container-DNS breakage (container resolv.conf points at an
+    # upstream DNS IP unreachable from the docker0 bridge — see DECISIONS.md);
+    # building with the host's network namespace bypasses it without touching
+    # the Docker daemon config or firewalld, which would disrupt unrelated
+    # running containers from other projects.
+    build:
+      context: ./gateway
+      network: host
+    ports: ["8000:8000"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://shieldstream_app:localdev_only@postgres:5432/shieldstream
+      LOG_LEVEL: debug
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      # :Z relabels the bind mount for exclusive container access under SELinux
+      # (Fedora enforces by default) — without it the container gets a silent
+      # Permission Denied reading a host-owned (user_home_t) directory.
+      - ./gateway/app:/app/app:Z
+
+  # One-off tooling container for Alembic migrations / seed script — run via
+  # `docker compose run --rm migrate alembic upgrade head` (see README).
+  # Not part of the default `up`; a fresh Python 3.12 image matching the
+  # gateway's own base image, since the host has no matching interpreter.
+  migrate:
+    build:
+      context: ./db
+      network: host
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://shieldstream:localdev_only@postgres:5432/shieldstream
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./db:/app:Z
+    profiles: ["tools"]
+
+volumes:
+  pg_data:
