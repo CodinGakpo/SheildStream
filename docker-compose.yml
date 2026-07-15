@@ -63,6 +63,30 @@ services:
       # Permission Denied reading a host-owned (user_home_t) directory.
       - ./gateway/app:/app/app:Z
 
+  # Analytics consumer: separate process from the gateway by design — a
+  # stalled DB write must never compete with live proxied requests for the
+  # gateway's event loop. Connects as shieldstream_worker (BYPASSRLS, the
+  # sole runtime writer to request_metrics — see DECISIONS.md, Phase 1).
+  analytics-consumer:
+    build:
+      context: ./consumers
+      network: host
+    command: ["python", "-m", "analytics.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://shieldstream_worker:localdev_only@postgres:5432/shieldstream
+      # Stable across restarts of this service so the consumer reclaims its
+      # own PEL instantly on restart (see worker.py). A real multi-replica
+      # deploy would derive this per-replica (e.g. from the task/pod id).
+      CONSUMER_NAME: analytics-1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./consumers:/app:Z
+
   # One-off tooling container for Alembic migrations / seed script — run via
   # `docker compose run --rm migrate alembic upgrade head` (see README).
   # Not part of the default `up`; a fresh Python 3.12 image matching the

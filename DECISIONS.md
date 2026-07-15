@@ -190,4 +190,28 @@ Other calls: the 429 path emits its own event (`rate_limited=1`, `latency_ms=0.0
 
 ---
 
-*(Phase 4b (Week 7, analytics consumer) appended next.)*
+## Phase 4b (Week 7) — Analytics consumer: Streams → TimescaleDB, at-least-once
+
+**Context:** A separate worker process (never a gateway background task — a stalled DB write there would compete with live requests for the same event loop) drains `request_events` into the `request_metrics` hypertable. The headline requirement is durability: kill it mid-flush, restart, and get zero loss and zero double-counting — proven by an actual kill-and-restart test, not asserted.
+
+**Core ordering rule:** `XACK` only *after* the TimescaleDB write commits. ACK-then-write would silently become at-most-once (a crash between them loses the batch). Write-then-ACK means the worst case is re-processing an already-written batch — a duplicate, not a loss — which is why the upsert must be idempotent.
+
+**Idempotent upsert:** `INSERT ... ON CONFLICT (bucket, tenant_id, endpoint, method) DO UPDATE` *increments* (`x = request_metrics.x + EXCLUDED.x`), never overwrites — verified directly (two 300-count batches on the same key → 600, not 300). The composite PK designed back in Week 2 exists exactly for this.
+
+**Deviation from the guide — crash recovery via stable consumer name, not random + XAUTOCLAIM-only.** The guide uses a random per-process consumer name and recovers solely via `XAUTOCLAIM` with a 30s idle threshold, run once at startup. **This is broken, and the guide's own kill-restart test (`sleep 10` then check) would expose it** — I hit it live: after a fast restart, the orphaned entries have been idle far less than 30s, so `XAUTOCLAIM` claims nothing, and the main loop's `XREADGROUP ... >` only sees *never-delivered* messages, never the already-delivered-but-unacked ones. The 500 test entries sat permanently stuck in the PEL (DB stayed 0, `XPENDING` stayed 500).
+
+Fixed with the production-standard pattern:
+- **Stable consumer name** (`CONSUMER_NAME` env / container hostname). On restart, the same-named consumer drains *its own* PEL instantly via `XREADGROUP ... 0` (`recover_own_pending`) — no idle wait, zero risk, because reclaiming your own assigned-but-unacked work can never steal a peer's.
+- **Periodic `XAUTOCLAIM` (30s idle)** kept as the backstop (`adopt_orphaned_pending`, swept every 15s in the main loop, not just at startup) for the *different* failure mode: a consumer that dies permanently (scaled down, replaced on deploy) whose orphans a surviving consumer must adopt.
+
+**Other decisions:** micro-batch (1000 events or 5s, whichever first — bounded so a large backlog drains as multiple flushes, never one giant lock-holding transaction). Aggregation is a pure, import-light module (`aggregate.py`) so bucketing/counting/percentile/poison-tolerance are unit-tested with zero infrastructure; the thin worker loop around it is covered by the live kill-restart test instead. Poison events (malformed fields) are logged, dropped, and still ACKed — never left to wedge the consumer in a crash-redeliver-crash loop on the same bad entry forever. Rate-limited events are excluded from latency percentiles (their conventional 0.0ms would corrupt p50/p99 during exactly the attack the dashboard is watching). Percentile merging across batches is a count-weighted average (weights derived from `total - blocked`) — **not** a true percentile of the combined distribution (that needs a t-digest sketch); a documented, accepted approximation for a dashboard metric, consistent with the guide's own "approximate aggregation is fine here" stance.
+
+**Verified live, repeatably:**
+- Baseline: 500 backlog events → exactly 500 `total_requests` in the DB, `XPENDING` → 0.
+- Kill-and-restart, done *correctly* (kill within the 5s batch window so 500 entries are genuinely delivered-but-unflushed — confirmed DB=0/PEL=500 at kill time): restart → `recovered_own_pending count=500` → exactly 500 in DB, 0 pending, 0 duplicates. **Repeated 3×, all PASS.** (First attempt was a false pass — the kill landed after the flush had already completed, so it proved normal operation, not recovery; caught it by checking DB=500 already at kill time and redid it with tight timing.)
+- Idempotent increment confirmed directly (600, not 300, on a doubled key).
+- Consumer lag under live load: 2000 requests → `XPENDING` drained 999→0 within ~2s, DB reached exactly 2000, no double-count of already-acked prior entries.
+
+---
+
+*(Phase 5 (Week 8+) appended next.)*
