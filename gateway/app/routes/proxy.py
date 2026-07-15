@@ -1,9 +1,16 @@
+import time
+import uuid
+
 import httpx
 from fastapi import APIRouter, Depends, Request, Response
+from redis.asyncio import Redis
 
 from app.auth import get_tenant
+from app.event_emitter import emit_event
+from app.events import RequestEvent, client_ip, hash_ip
 from app.http_client import get_http_client
 from app.middleware.rate_limit import enforce_rate_limit
+from app.redis_client import get_redis
 from app.tracing import tracer
 
 router = APIRouter()
@@ -22,7 +29,9 @@ async def proxy(
     tenant: dict = Depends(get_tenant),
     rate_limit: dict = Depends(enforce_rate_limit),
     client: httpx.AsyncClient = Depends(get_http_client),
+    redis: Redis = Depends(get_redis),
 ) -> Response:
+    start = time.perf_counter()
     downstream_url = f"{tenant['upstream_base_url']}/{path}"
     body = await request.body()
 
@@ -42,6 +51,23 @@ async def proxy(
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=5.0, pool=2.0),
         )
         span.set_attribute("http.status_code", upstream_response.status_code)
+
+    emit_event(  # fire-and-forget, deliberately NOT awaited — see event_emitter.py
+        redis,
+        RequestEvent(
+            request_id=str(uuid.uuid4()),
+            tenant_id=tenant["id"],
+            endpoint=f"/proxy/{path}",
+            method=request.method,
+            status_code=upstream_response.status_code,
+            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+            rate_limited=False,  # the 429 path emits its own event before short-circuiting
+            remote_ip_hash=hash_ip(client_ip(request), tenant["ip_hash_salt"]),
+            timestamp_ms=int(time.time() * 1000),
+            query_string=str(request.url.query),
+            user_agent=request.headers.get("user-agent", ""),
+        ),
+    )
 
     response = Response(
         content=upstream_response.content,

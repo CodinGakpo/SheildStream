@@ -18,6 +18,8 @@ dependency declare it.
 """
 
 import logging
+import time
+import uuid
 
 from fastapi import Depends, HTTPException, Request
 from redis.asyncio import Redis
@@ -25,6 +27,8 @@ from redis.exceptions import RedisError
 
 from app.auth import get_tenant
 from app.config import settings
+from app.event_emitter import emit_event
+from app.events import RequestEvent, client_ip, hash_ip
 from app.fallback_limiter import in_memory_check
 from app.policy import get_policy
 from app.rate_limiter import check_rate_limit
@@ -77,6 +81,29 @@ async def enforce_rate_limit(
             span.set_attribute("shieldstream.fail_open", True)
 
     if not allowed:
+        # Blocked requests never reach the proxy handler's own emit call, so
+        # this path emits its own event before short-circuiting — otherwise
+        # the analytics pipeline would systematically undercount exactly the
+        # traffic a security gateway most needs to see. latency_ms is 0.0 by
+        # convention: there is no upstream round trip to measure, and the
+        # analytics consumer excludes rate-limited events from latency
+        # percentiles for that reason.
+        emit_event(
+            redis,
+            RequestEvent(
+                request_id=str(uuid.uuid4()),
+                tenant_id=tenant["id"],
+                endpoint=route,
+                method=request.method,
+                status_code=429,
+                latency_ms=0.0,
+                rate_limited=True,
+                remote_ip_hash=hash_ip(client_ip(request), tenant["ip_hash_salt"]),
+                timestamp_ms=int(time.time() * 1000),
+                query_string=str(request.url.query),
+                user_agent=request.headers.get("user-agent", ""),
+            ),
+        )
         raise HTTPException(
             status_code=429,
             detail="rate limit exceeded",

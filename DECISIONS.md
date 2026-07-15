@@ -168,4 +168,26 @@ The guide's own Week 5 pitfall list warns "testing fail-open only by mocking the
 
 ---
 
-*(Phase 4 (Week 6+) appended as each phase is implemented.)*
+## Phase 4a (Week 6) — Redis Streams producer: event emission off the critical path
+
+**Context:** Every proxied request must feed the analytics and threat-detection pipelines, but a synchronous write (to Postgres, or even to Redis if awaited inline) puts that storage system's latency on the client's critical path. The design requirement is strict: emission must be *invisible* in the request-latency histogram.
+
+**Alternatives considered:** Synchronous Postgres insert per request (rejected: collapses request latency under load — the DB becomes a back-pressure source on the hot path). Redis List as a queue (rejected: `LPOP` is destructive — two independent downstream readers, Week 7's analytics and Week 8's alerts, would need duplicated writes or a fan-out layer; Streams consumer groups give publish-once/consume-independently natively). Awaiting the XADD inline (rejected: XADD is fast (~0.1ms) but still a Redis round trip on every request, and during a Redis stall it would block responses — the exact coupling this design removes).
+
+**Decision:** `emit_event()` schedules the XADD via `asyncio.create_task()` and returns immediately, with two sharp edges handled explicitly (both are the kind of bug that passes every functional test, then bites in production):
+1. **Task garbage collection** — the event loop holds created tasks only weakly; a module-level strong-reference set (`_background_tasks`) prevents a not-yet-finished task from being silently collected/cancelled, removed again via `add_done_callback` on completion.
+2. **Silent exceptions** — a fire-and-forget task's exception propagates nowhere; the done-callback inspects `task.exception()` and converts failures into a log line + `shieldstream_event_emit_failures_total` Prometheus counter instead of an invisibly dropped event.
+
+Stream is bounded with `MAXLEN ~ 100,000` (approximate): exact trimming costs a check on every XADD; approximate trims only at radix-tree macro-node boundaries — functionally exact here since consumers drain entries within seconds.
+
+Other calls: the 429 path emits its own event (`rate_limited=1`, `latency_ms=0.0` by convention — no upstream round trip exists to measure; the consumer excludes rate-limited events from latency percentiles) before short-circuiting, so blocked traffic — exactly what a security gateway most needs to see — isn't systematically undercounted. Client IPs are salted-hashed (`SHA-256(ip + per-tenant salt)`, 16 hex chars) at the point of origin: no downstream component can mishandle raw IP data because none ever receives it, and the per-tenant salt makes cross-tenant correlation of one client impossible by construction. `client_ip()` relies on uvicorn's `--proxy-headers` (enabled at deployment, scoped to the trusted proxy) rather than hand-parsing spoofable `X-Forwarded-For` (REVISION #6).
+
+**Verified live:**
+- 20 requests → exactly 20 stream entries; all fields present, string-typed, `remote_ip_hash` a 16-char hex digest, never a raw IP.
+- 429 responses produce `rate_limited=1` events with `status_code=429`.
+- Latency: p50 11.2ms at c=5 with emission enabled (vs 8.4ms Phase 2 baseline) — but Jaeger span breakdown attributes the delta entirely to Week 5's rate-limiter path (`rate_limiter.check` 0.3–2.7ms) and normal variance; **emission itself appears in no span and adds no measurable request-path time**, exactly as designed. (First measurement attempt was discarded: 500 requests against the 100/60s limit meant most responses were fast 429s, silently skewing the latency distribution downward — a good reminder that a "better" number needs its status-code distribution checked before it's believed.)
+- Trimming verified experimentally, not by reading the call's arguments: 150k pipelined XADDs with `MAXLEN ~ 100k` → `XLEN` = 100,000.
+
+---
+
+*(Phase 4b (Week 7, analytics consumer) appended next.)*
