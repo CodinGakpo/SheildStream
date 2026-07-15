@@ -5,6 +5,9 @@ httpx==0.28.1
 redis==5.2.1
 asyncpg==0.30.0
 SQLAlchemy==2.0.36
+greenlet==3.5.3  # SQLAlchemy's async engine requires this; pinned explicitly
+                 # after it silently failed to resolve transitively in one
+                 # environment (see DECISIONS.md, Week 5)
 structlog==24.4.0
 prometheus-client==0.21.1
 opentelemetry-sdk==1.29.0

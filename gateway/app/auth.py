@@ -1,14 +1,18 @@
 import hashlib
 import json
+import logging
 
 from fastapi import Depends, Header, HTTPException
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import session_factory
 from app.redis_client import get_redis
 from app.tracing import tracer
+
+logger = logging.getLogger("shieldstream.auth")
 
 CACHE_TTL_S = 30  # see Week 3 decision log
 
@@ -50,12 +54,27 @@ async def get_tenant(
 
     No `db: AsyncSession = Depends(...)` parameter here — see the comment on
     `get_db_session` in app/db.py for why. A session is opened explicitly,
-    only inside the cache-miss branch below."""
+    only inside the cache-miss branch below.
+
+    Resilient to Redis being unreachable, same pattern as app.policy: a
+    RedisError on the cache read falls through to Postgres — the source of
+    truth for tenant identity — rather than 500ing every request outright,
+    and a failure repopulating the cache is swallowed rather than raised.
+    This gap was only found while live-testing Week 5's rate-limiter
+    fail-open behavior (killing the Redis container mid-traffic): auth ran
+    *before* the rate limiter in the dependency chain and had no error
+    handling at all, so every request 500'd before the rate limiter's own
+    fail-open logic ever got a chance to run."""
     with tracer.start_as_current_span("auth.validate_key") as span:
         key_hash = hash_key(x_api_key)
         cache_key = f"tenant:apikey:{key_hash}"
 
-        cached = await redis.get(cache_key)
+        try:
+            cached = await redis.get(cache_key)
+        except RedisError:
+            logger.warning("tenant_cache_unavailable")
+            cached = None
+
         if cached:
             span.set_attribute("shieldstream.cache_hit", True)
             return json.loads(cached)
@@ -66,5 +85,9 @@ async def get_tenant(
         if tenant is None:
             raise HTTPException(status_code=401, detail="invalid API key")
 
-        await redis.set(cache_key, json.dumps(tenant), ex=CACHE_TTL_S)
+        try:
+            await redis.set(cache_key, json.dumps(tenant), ex=CACHE_TTL_S)
+        except RedisError:
+            pass  # best-effort repopulation; the DB read above already succeeded
+
         return tenant

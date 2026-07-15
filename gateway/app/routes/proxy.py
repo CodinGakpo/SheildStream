@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from app.auth import get_tenant
 from app.http_client import get_http_client
+from app.middleware.rate_limit import enforce_rate_limit
 from app.tracing import tracer
 
 router = APIRouter()
@@ -19,6 +20,7 @@ async def proxy(
     path: str,
     request: Request,
     tenant: dict = Depends(get_tenant),
+    rate_limit: dict = Depends(enforce_rate_limit),
     client: httpx.AsyncClient = Depends(get_http_client),
 ) -> Response:
     downstream_url = f"{tenant['upstream_base_url']}/{path}"
@@ -41,10 +43,18 @@ async def proxy(
         )
         span.set_attribute("http.status_code", upstream_response.status_code)
 
-    return Response(
+    response = Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
         headers={
             k: v for k, v in upstream_response.headers.items() if k.lower() not in _HOP_BY_HOP
         },
     )
+    # Set on every successful response, not just 429s — lets a well-behaved
+    # client self-throttle proactively instead of discovering the limit by
+    # being rejected (RFC 6585 territory, but these three headers aren't
+    # formally standardized, just conventional).
+    if rate_limit["limit"] is not None:
+        response.headers["X-RateLimit-Limit"] = str(rate_limit["limit"])
+        response.headers["X-RateLimit-Remaining"] = str(rate_limit["remaining"])
+    return response

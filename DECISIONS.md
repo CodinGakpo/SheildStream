@@ -137,4 +137,35 @@ Maintained incrementally as decisions are made, not written retroactively. Each 
 
 ---
 
-*(Phase 3b (Week 5) and beyond appended as each phase is implemented.)*
+## Phase 3b (Week 5) — Rate limiter middleware, policy engine, fail-open
+
+### Middleware position and mechanism
+
+**Context:** The guide implements rate limiting as Starlette `@app.middleware("http")`, reading `request.state.tenant` — but Starlette's middleware chain runs *before* FastAPI resolves a route's `Depends()` parameters. `request.state.tenant` doesn't exist yet at that point; the guide's own code would raise `AttributeError` on its very first request.
+
+**Decision:** Implemented as a FastAPI dependency (`app/middleware/rate_limit.py::enforce_rate_limit`, despite the `middleware/` directory name — kept for structural continuity with the guide, documented as a deliberate deviation in the module's own docstring) that takes `tenant: dict = Depends(get_tenant)` as a sub-dependency. FastAPI resolves `get_tenant` once, then `enforce_rate_limit`, in an explicit, testable order — no reliance on registration-order semantics that (per the guide's own Week 5 pitfall list) are easy to get backwards.
+
+### Policy engine: Redis-cached, Postgres-backed, resilient to cache failure
+
+10s TTL (shorter than auth's 30s tenant-identity cache — an operator tightening a limit during an incident wants that to propagate fast) via `app/policy.py::get_policy`, matching `route_pattern` glob-to-SQL-LIKE with longest-pattern-wins tie-breaking. Cached payload includes `policy_version`, per the guide's own pitfall list, to avoid a cache-schema migration when Week 9's push-based invalidation is built. **Verified live:** dropped `acme-corp`'s limit from 100→2 via a direct `UPDATE`; enforcement caught up within the 10s TTL bound.
+
+### Fail-open, and three real bugs found only by actually killing Redis
+
+The guide's own Week 5 pitfall list warns "testing fail-open only by mocking the Redis client... never by actually killing the container" is insufficient — this played out exactly as warned. Killing the `redis` container live surfaced three real defects that a mocked-exception unit test would never have caught:
+
+1. **`auth.py` had zero Redis error handling.** `get_tenant`'s cache `GET` was unguarded — a Redis outage 500'd every request before the rate limiter's own fail-open logic ever ran. Fixed with the same resilient-cache pattern as `policy.py`: `RedisError` on the cache read falls through to Postgres (auth's actual source of truth, entirely independent of Redis); a failure on the cache-repopulation write is swallowed. This isn't "fail open" in the security sense — auth still genuinely authenticates via Postgres — it's making the cache *layer* resilient, which the rate limiter's fail-open logic assumes has already happened before it gets a turn.
+
+2. **No socket timeout on the Redis client at all.** `Redis.from_url()` had no `socket_connect_timeout`/`socket_timeout`. Against a fully-stopped (not just DNS-broken) container, this meant each request could hang for tens of seconds on an OS-level TCP timeout before a `RedisError` ever surfaced — a "fail-open" that takes 30+ seconds per request to trigger isn't preserving availability, it's replacing a clean failure with a slow one. Fixed: explicit `socket_connect_timeout=0.2, socket_timeout=0.2` on the shared client.
+
+3. **A genuine `uvloop`/`anyio` interaction bug** (not an application bug, but real and reproducible): with `uvloop` installed (uvicorn's default when available via `uvicorn[standard]`), a timed-out Redis connection attempt left the process's async DNS-resolution machinery in a state where the *next, completely unrelated* async DNS lookup (`httpx` resolving the downstream proxy target) also failed — consistently, for the full configured connect timeout (verified at exactly 2002.1ms via a captured Jaeger span, matching the configured `connect=2.0` budget precisely). Isolated by reproducing outside the app entirely: a standalone script under the default asyncio loop never reproduced it; the identical script with `uvloop.install()` reproduced it every time. **Decision:** `uvicorn ... --loop asyncio`, trading uvloop's throughput edge for correctness during exactly the failure scenario this week exists to handle gracefully — a defensible trade for a project whose point is provable correctness under failure, not raw throughput. Not fully root-caused to a single line inside uvloop/anyio's DNS resolver internals (would require bisecting their source), but conclusively isolated to that layer via a controlled reproduction, which is the standard of evidence used throughout this project's debugging.
+
+**Verified end-to-end, live, not mocked:**
+- Exceeding the seeded 100 req/60s limit: exactly 100 succeed, requests 101+ return `429` with `Retry-After: 60`, `X-RateLimit-Limit: 100`, `X-RateLimit-Remaining: 0`.
+- `X-RateLimit-Limit`/`X-RateLimit-Remaining` present and decrementing correctly on every successful response, not just 429s.
+- Killing the `redis` container mid-traffic: after the three fixes above, every request returns `200` (fail-open engaged, bounded at ~1.0s — the cost of three short, sequential cache-miss timeouts across auth/policy/rate-limiter — rather than 500ing or hanging), with `redis_unavailable` / `tenant_cache_unavailable` / `policy_cache_unavailable` cleanly logged for each fallback path taken.
+- Restarting `redis`: distributed rate limiting resumes correctly with no manual intervention, no restart of the gateway required.
+- Also fixed in passing: `greenlet` (a required transitive dependency of SQLAlchemy's async engine) silently failed to resolve in the host venv despite being present in the Docker image — now pinned explicitly in `requirements.txt` rather than relied on transitively.
+
+---
+
+*(Phase 4 (Week 6+) appended as each phase is implemented.)*
