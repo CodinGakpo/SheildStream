@@ -116,4 +116,25 @@ Maintained incrementally as decisions are made, not written retroactively. Each 
 
 ---
 
-*(Phases 3+ decisions appended as each phase is implemented.)*
+## Phase 3a (Week 4) — Atomic sliding-window rate limiter
+
+**Context:** A naive rate limiter (`INCR` + `EXPIRE`, or separate `ZCARD`-then-`ZADD` calls from the application) has one of two flaws: a fixed-window counter allows a 2x burst at the window boundary (full limit in the last second of one window, full limit again in the first second of the next); and even a sliding-window *log* implemented as separate Redis calls from Python has a check-then-act race — two concurrent requests can both read "9 of 10, proceed" before either has recorded its own request, because `MULTI`/`EXEC` guarantees atomic execution of queued commands but not isolation between two separate transactions' read and write phases.
+
+**Alternatives considered:** Token bucket — a genuinely strong algorithm (allows controlled bursting), but its state is a single opaque number, not a replayable log, so "why was I rate limited" has no precise answer; also adds distributed refill-timing complexity not justified here. Fixed window counter — rejected outright for the boundary-burst flaw. `WATCH`-based optimistic locking with client-side retry — works, but adds retry-storm risk under contention and more client-side complexity than one atomic script.
+
+**Decision:** Sliding-window log on a Redis Sorted Set (member = request UUID, score = timestamp ms), with the entire check-then-act sequence (`ZREMRANGEBYSCORE` → `ZCARD` → conditional `ZADD` + `PEXPIRE`) as one Lua script. Redis executes a Lua script to completion as a single atomic unit — no other client's command can interleave — which eliminates the race by construction rather than by careful call ordering. `EVALSHA` (not `EVAL`) sends only the script's hash on the hot path, with a `NoScriptError` → reload-and-retry-once fallback for the case where Redis's script cache was flushed (restart, `SCRIPT FLUSH`) but the app still holds a stale SHA.
+
+**Trade-off accepted:** O(n) memory per key, where n = requests inside the current window — a Sorted Set entry costs roughly 64 bytes, so at meaningful per-IP cardinality and high RPS this stops being viable (documented migration path: approximate counting via HyperLogLog, or token bucket, reserved for exact per-tenant/per-API-key enforcement where cardinality is bounded). Not a concern at this project's scale.
+
+**Verified:**
+- 100 concurrent async calls against a limit of 10 → exactly 10 allowed, 90 blocked — proven, not assumed, via `asyncio.gather()` (sequential calls alone would never expose the race).
+- That same concurrency proof repeated 50 times via `pytest-repeat`: 50/50 passed, zero flakiness.
+- Sliding window correctly resets once the window elapses (time-mocked test) — the exact case a fixed-window counter gets wrong.
+- Live Redis (not fakeredis) round-trip latency: p50 = 0.116ms, p99 = 0.206ms — well inside the guide's <1ms/<2ms targets.
+- `fakeredis[lua]` (the `lupa`-backed extra) executes the *real* Lua script against a real Lua interpreter, not a hand-rolled reimplementation of its semantics — so the unit tests exercise the actual atomicity guarantee, not a stand-in for it.
+
+**Explicitly not done yet (Week 5, next):** the rate limiter is correct in isolation but not wired into the request path — no middleware, no policy-driven limits from the `policies` table, no 429/`Retry-After` response semantics, no fail-open behavior on Redis unavailability. `check_rate_limit()` exists and is proven; nothing calls it from `routes/proxy.py` yet.
+
+---
+
+*(Phase 3b (Week 5) and beyond appended as each phase is implemented.)*
