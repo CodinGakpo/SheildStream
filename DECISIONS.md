@@ -246,4 +246,18 @@ The consumer runs two detection tiers on every event and publishes structured, s
 
 ---
 
+## Tooling — Playwright API E2E suite (`e2e/`)
+
+**Why a second test suite alongside `gateway/tests` (pytest).** The pytest suite calls the FastAPI app in-process via `httpx.ASGITransport` — fast, and sufficient for app logic, but it never actually crosses a socket. `e2e/` is a deliberately different kind of test: a black-box client hitting the *deployed* compose stack over real HTTP, exercising the real proxy, real Redis-backed auth cache and rate limiter, and real uvicorn response headers. No browser is launched — Playwright's `request` fixture does pure API testing, so there's no `playwright install` browser download; that changes once the Week 9 dashboard exists and gets real browser specs.
+
+**Fixture design — two fixed tenants, seeded idempotently.** `tenants.name` has no unique constraint (only `api_key_hash` does), so `global-setup.ts` seeds by **delete-then-insert** on every run rather than upserting. That turned out to matter for more than idempotency: `tenant_id` is `gen_random_uuid()`-default, and the Week 4 limiter's key is `rate:{tenant_id}:route` — so a fresh `tenant_id` on every run also resets the sliding-window budget, which is what lets `rate_limit.spec.ts` assert an exact request count deterministically instead of inheriting whatever a previous run already spent.
+
+That surfaced a real correctness gap during setup, not just a theoretical one: `app/auth.py` caches the tenant lookup in Redis for 30s, keyed by `api_key_hash` — and the raw API key here is intentionally fixed across runs (so specs don't need coordination), meaning the hash is fixed too. Reseeding a new `tenant_id` behind an unchanged, still-cached hash would silently serve the *old* tenant_id back to the gateway for up to 30s. Confirmed live: rerunning the suite immediately (well inside the 30s TTL) without a cache-eviction step reused the stale cached tenant. Fixed by having `global-setup.ts` `DEL` the two `tenant:apikey:<hash>` keys in Redis right after reseeding Postgres — verified by rerunning twice back-to-back, both times green, both times the rate-limit spec tripping 429 exactly at its own tenant's limit rather than an inherited one.
+
+A separate `e2e-ratelimit` tenant (rate_limit_rps=3) exists solely so that spec can trip 429 in a handful of requests, rather than needing ~100 requests against the shared `e2e-auth` tenant's 100 rps policy (which would also pollute that tenant's window for the auth/proxy specs running nearby).
+
+**Coverage (6 specs, all live-verified against the running stack):** missing-header 422 vs invalid-key 401 vs valid-key 200 (`auth.spec.ts`); upstream passthrough with query-param preservation and `X-API-Key` stripped before forwarding (`proxy.spec.ts`); exceeding a tight policy → 429 with `Retry-After` and `X-RateLimit-Remaining: 0` (`rate_limit.spec.ts`).
+
+---
+
 *(Phase 5 continues: Week 9 hot-reload + dashboard, Week 10 observability.)*

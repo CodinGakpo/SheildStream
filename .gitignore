@@ -17,3 +17,6 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+/e2e/test-results/
+/e2e/playwright-report/
+/e2e/playwright/.cache/
