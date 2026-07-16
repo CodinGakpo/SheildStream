@@ -87,6 +87,27 @@ services:
     volumes:
       - ./consumers:/app:Z
 
+  # Alert consumer: the second independent reader of request_events, via its
+  # own consumer group (alert-cg), structurally decoupled from analytics-cg.
+  # No DATABASE_URL — this consumer never touches Postgres; it runs two
+  # detection tiers in memory and publishes alerts to the dashboard:alerts
+  # Redis Pub/Sub channel. Single replica by design: the statistical tier's
+  # per-endpoint RPS baseline is only correct when one consumer sees the whole
+  # stream (see consumers/alerts/rps_window.py).
+  alert-consumer:
+    build:
+      context: ./consumers
+      network: host
+    command: ["python", "-m", "alerts.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CONSUMER_NAME: alert-1
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./consumers:/app:Z
+
   # One-off tooling container for Alembic migrations / seed script — run via
   # `docker compose run --rm migrate alembic upgrade head` (see README).
   # Not part of the default `up`; a fresh Python 3.12 image matching the
