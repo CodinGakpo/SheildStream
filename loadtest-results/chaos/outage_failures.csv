@@ -1,0 +1,4 @@
+Method,Name,Error,Occurrences
+POST,/proxy/post,HTTPError('500 Server Error: Internal Server Error for url: /proxy/post'),15
+GET,/proxy/get [sqli-probe],HTTPError('500 Server Error: Internal Server Error for url: /proxy/get [sqli-probe]'),1
+GET,/proxy/get,HTTPError('500 Server Error: Internal Server Error for url: /proxy/get'),51

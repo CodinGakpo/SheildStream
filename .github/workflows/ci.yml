@@ -1,0 +1,180 @@
+name: CI/CD
+
+# lint/test run on every push and PR — fully functional, no external
+# secrets needed (unit tests use fakeredis/mocks, never a live DB — see
+# DECISIONS.md Phase 0/1). build/security-scan additionally need GHCR write
+# access, which github.token already provides for this repo, so they also
+# run unconditionally on main. migrate/deploy/smoke-test need real
+# infrastructure (a provisioned VM + Neon branch, see infra/DEPLOY.md) that
+# does not exist until someone actually runs that runbook — gated behind
+# the `deploy-enabled` repository variable so this workflow is genuinely
+# green on a fresh clone instead of failing on missing secrets it has no
+# way to have yet.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install ruff
+      - run: ruff check gateway/app gateway/tests
+
+  lint-consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install ruff
+      - run: ruff check consumers/alerts consumers/analytics consumers/tests
+
+  lint-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+        working-directory: dashboard
+      - run: npm run lint
+        working-directory: dashboard
+
+  test-gateway:
+    runs-on: ubuntu-latest
+    env:
+      # Values are never actually connected to — Settings() just needs to
+      # validate (see app/config.py); every unit test mocks or fakes its
+      # infra dependency (fakeredis for Redis, nothing touches Postgres).
+      REDIS_URL: redis://localhost:6379/0
+      DATABASE_URL: postgresql+asyncpg://user:pass@localhost/shieldstream
+      ADMIN_DATABASE_URL: postgresql+asyncpg://user:pass@localhost/shieldstream
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-dev.txt # already pulls in requirements.txt
+        working-directory: gateway
+      - run: pytest
+        working-directory: gateway
+
+  test-consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt pytest pytest-asyncio fakeredis
+        working-directory: consumers
+      - run: pytest
+        working-directory: consumers
+
+  build:
+    needs: [lint-gateway, lint-consumers, lint-dashboard, test-gateway, test-consumers]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      gateway-image: ${{ steps.tags.outputs.gateway }}
+      consumers-image: ${{ steps.tags.outputs.consumers }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tags
+        run: |
+          echo "gateway=ghcr.io/${{ github.repository_owner }}/shieldstream-gateway:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "consumers=ghcr.io/${{ github.repository_owner }}/shieldstream-consumers:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # built-in, never a stored PAT
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./gateway
+          push: true
+          tags: ${{ steps.tags.outputs.gateway }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./consumers
+          push: true
+          tags: ${{ steps.tags.outputs.consumers }}
+
+  security-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ needs.build.outputs.gateway-image }}
+          severity: CRITICAL # not MEDIUM/LOW — see DECISIONS.md, avoids alert fatigue
+          exit-code: "1"
+      - uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ needs.build.outputs.consumers-image }}
+          severity: CRITICAL
+          exit-code: "1"
+
+  # --- Everything below here needs real infrastructure that does not exist
+  # until infra/DEPLOY.md has actually been run once. Set the `deploy-enabled`
+  # repository variable to "true" (Settings -> Secrets and variables ->
+  # Actions -> Variables) once it has, alongside the secrets each step below
+  # references.
+  migrate:
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' && vars.deploy-enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+        working-directory: db
+      - run: alembic upgrade head
+        working-directory: db
+        env:
+          # The Neon branch owner role (CREATEROLE) — see infra/neon-notes.md.
+          MIGRATION_DATABASE_URL: ${{ secrets.NEON_MIGRATION_URL }}
+
+  deploy:
+    needs: migrate
+    if: github.ref == 'refs/heads/main' && vars.deploy-enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Honest limitation, not glossed over: OIDC federation (this job's
+      # "zero stored keys" ideal) works cleanly against a cloud provider's
+      # IAM — the guide's original ECS target. A bare VM has no IAM to
+      # federate against; SSH is the only way in, and SSH needs *a* stored
+      # credential no matter what. GHCR push above (the part that maps
+      # cleanly to OIDC-style ambient auth) uses the built-in
+      # `secrets.GITHUB_TOKEN`, never a stored PAT — that's the zero-stored-
+      # key property preserved where it can be. This step's `DEPLOY_SSH_KEY`
+      # secret is the one unavoidable exception for this deployment shape.
+      - uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd shieldstream/infra
+            IMAGE_TAG=${{ github.sha }} docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+  smoke-test:
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && vars.deploy-enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -f --max-time 10 https://${{ vars.deploy-domain }}/health

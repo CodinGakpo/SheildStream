@@ -4,7 +4,6 @@ import fakeredis.aioredis
 import pytest
 from prometheus_client import REGISTRY
 
-from app import event_emitter
 from app.event_emitter import STREAM_KEY, _background_tasks, emit_event
 from tests.test_events import make_event
 
