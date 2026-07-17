@@ -5,6 +5,8 @@ from pathlib import Path
 from redis.asyncio import Redis
 from redis.exceptions import NoScriptError
 
+from app.metrics import REDIS_LUA_LATENCY_MS
+
 _SCRIPT_PATH = Path(__file__).parent / "lua" / "sliding_window.lua"
 _script_sha: str | None = None
 
@@ -40,6 +42,7 @@ async def check_rate_limit(
     if _script_sha is None:
         await load_script(redis)
 
+    lua_start = time.perf_counter()
     try:
         allowed, remaining = await redis.evalsha(
             _script_sha, 1, key, now_ms, window_s * 1000, limit, request_id
@@ -52,5 +55,10 @@ async def check_rate_limit(
         allowed, remaining = await redis.evalsha(
             _script_sha, 1, key, now_ms, window_s * 1000, limit, request_id
         )
+    finally:
+        # In the finally block (not just the happy path): a NoScriptError
+        # retry still incurs a real round trip worth measuring, and the
+        # histogram should reflect the call's actual cost either way.
+        REDIS_LUA_LATENCY_MS.observe((time.perf_counter() - lua_start) * 1000)
 
     return bool(allowed), remaining

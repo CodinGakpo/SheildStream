@@ -30,6 +30,7 @@ from app.config import settings
 from app.event_emitter import emit_event
 from app.events import RequestEvent, client_ip, hash_ip
 from app.fallback_limiter import in_memory_check
+from app.metrics import RATE_LIMIT_HITS_TOTAL, REQUESTS_TOTAL, status_class
 from app.policy import get_policy
 from app.rate_limiter import check_rate_limit
 from app.redis_client import get_redis
@@ -104,6 +105,8 @@ async def enforce_rate_limit(
                 user_agent=request.headers.get("user-agent", ""),
             ),
         )
+        RATE_LIMIT_HITS_TOTAL.inc()
+        REQUESTS_TOTAL.labels(status_class=status_class(429)).inc()
         raise HTTPException(
             status_code=429,
             detail="rate limit exceeded",

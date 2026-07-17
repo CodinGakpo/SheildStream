@@ -9,6 +9,7 @@ from app.auth import get_tenant
 from app.event_emitter import emit_event
 from app.events import RequestEvent, client_ip, hash_ip
 from app.http_client import get_http_client
+from app.metrics import PROXY_LATENCY_MS, REQUESTS_TOTAL, status_class
 from app.middleware.rate_limit import enforce_rate_limit
 from app.redis_client import get_redis
 from app.tracing import tracer
@@ -52,6 +53,10 @@ async def proxy(
         )
         span.set_attribute("http.status_code", upstream_response.status_code)
 
+    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+    REQUESTS_TOTAL.labels(status_class=status_class(upstream_response.status_code)).inc()
+    PROXY_LATENCY_MS.observe(latency_ms)
+
     emit_event(  # fire-and-forget, deliberately NOT awaited — see event_emitter.py
         redis,
         RequestEvent(
@@ -60,7 +65,7 @@ async def proxy(
             endpoint=f"/proxy/{path}",
             method=request.method,
             status_code=upstream_response.status_code,
-            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+            latency_ms=latency_ms,
             rate_limited=False,  # the 429 path emits its own event before short-circuiting
             remote_ip_hash=hash_ip(client_ip(request), tenant["ip_hash_salt"]),
             timestamp_ms=int(time.time() * 1000),
