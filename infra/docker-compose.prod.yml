@@ -1,0 +1,114 @@
+# Week 11 hybrid free-tier deployment — the always-free VM's own compose
+# file. Deliberately NOT an overlay on top of the repo-root docker-compose.yml
+# (that file is dev-shaped: local Postgres, httpbin as a fake upstream,
+# source bind-mounts for live editing). This is a separate, smaller stack:
+# no local Postgres (Neon instead, see neon-notes.md), no httpbin (real
+# tenant upstreams), images pulled from GHCR instead of built from a
+# bind-mounted source tree, and Caddy in front instead of nothing.
+#
+# Run from this directory: `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d`
+services:
+  redis:
+    image: redis:7.4-alpine
+    # Unlike the dev stack, this Redis needs to survive a VM reboot without
+    # silently losing unacked Streams entries (analytics-cg / alert-cg) —
+    # appendonly persistence, not the dev default of none.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    image: ghcr.io/${GHCR_OWNER}/shieldstream-gateway:${IMAGE_TAG:-latest}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL}       # Neon, shieldstream_app role
+      ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL}  # Neon, shieldstream_worker role
+      LOG_LEVEL: info   # NOT debug — see DECISIONS.md Week 11's load-test finding
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    # --proxy-headers/--forwarded-allow-ips: trust X-Forwarded-For only from
+    # Caddy's container, matching app/events.py's client_ip() assumption
+    # (REVISION #6). No bind mount, no --reload — the image already has the
+    # built app.
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --loop asyncio
+      --proxy-headers --forwarded-allow-ips=*
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  analytics-consumer:
+    image: ghcr.io/${GHCR_OWNER}/shieldstream-analytics-consumer:${IMAGE_TAG:-latest}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${WORKER_DATABASE_URL}  # Neon, shieldstream_worker, plain postgresql:// (asyncpg)
+      CONSUMER_NAME: analytics-1
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  alert-consumer:
+    image: ghcr.io/${GHCR_OWNER}/shieldstream-alert-consumer:${IMAGE_TAG:-latest}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CONSUMER_NAME: alert-1
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    restart: unless-stopped
+    # Not exposed via Caddy — an internal trace viewer, not a public page.
+    # `ssh -L 16686:localhost:16686 <vm>` to view it from a laptop.
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ../observability/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: https://grafana.example.com  # match the Caddyfile
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - gateway
+      - grafana
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:

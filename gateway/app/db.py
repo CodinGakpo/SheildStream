@@ -4,7 +4,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.config import settings
 
-engine = create_async_engine(settings.database_url, pool_size=10, max_overflow=5)
+# pool_size/max_overflow raised from 10/5 — Week 11's load test hit
+# `QueuePool limit ... overflow 5 reached` under 1000 concurrent users: a
+# fixed API key's 30s auth-cache TTL (app/auth.py) means a burst of new
+# connections arriving faster than the cache warms (exactly what a load
+# test's ramp-up does) all fall through to the DB at once, a real thundering
+# herd on cache-miss. Postgres's own max_connections is 100 (confirmed via
+# `SHOW max_connections`); 50 here plus the admin engine's 4 and the
+# analytics consumer's 5 leaves comfortable headroom.
+engine = create_async_engine(settings.database_url, pool_size=30, max_overflow=20)
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 # Small dedicated pool for the low-volume admin API, connected as

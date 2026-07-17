@@ -88,6 +88,17 @@ services:
     # entirely. If horizontal scaling needs live-testing again, temporarily
     # widen this back to a range.
     ports: ["8000:8000"]
+    # Week 11 finding: the default 1024 nofile soft limit ran out under the
+    # load test's 1000 concurrent users (each an open client socket, plus
+    # this process's own upstream httpx and DB/Redis connections) —
+    # "socket.accept() out of system resource: Too many open files"
+    # (OSError 24), logged by asyncio itself, not raised as a normal
+    # exception, so it never showed up as a clean 500 from FastAPI's own
+    # error handling.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://shieldstream_app:localdev_only@postgres:5432/shieldstream
@@ -182,6 +193,27 @@ services:
     volumes:
       - ./db:/app:Z
     profiles: ["tools"]
+
+  # Week 11 load test — `docker compose --profile loadtest up loadtest`.
+  # Separate container from the gateway by design: the guide's own advice is
+  # to run the load generator on a separate *machine*, arguing contention
+  # between generator and target under test would corrupt the measurement.
+  # A single dev machine can't give it a separate machine, but a separate
+  # container at least keeps it off the gateway's own process/event loop —
+  # documented as an accepted, honest simplification in DECISIONS.md, not a
+  # silent gap.
+  loadtest:
+    build:
+      context: ./loadtest
+      network: host
+    volumes:
+      - ./loadtest:/app:z
+      - ./loadtest-results:/results:z
+    command: >
+      locust -f locustfile.py --headless
+      --host http://gateway:8000
+      --html /results/report.html --csv /results/stats
+    profiles: ["loadtest"]
 
 volumes:
   pg_data:

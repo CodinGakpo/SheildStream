@@ -1,0 +1,29 @@
+# Week 11: Caddy replaces the guide's ALB — automatic HTTPS (Let's Encrypt,
+# zero manual cert management) for free, which an ALB does not give you
+# without also paying for ACM + Route53. Two proxied paths on one domain:
+# the gateway's proxy/admin API and its WebSocket dashboard feed.
+#
+# Replace `api.example.com` with the real domain before deploying, and set
+# it up to point at the VM's IP first (DNS propagation, then Caddy issues
+# the cert on first request — no separate cert-request step).
+api.example.com {
+    # /ws/dashboard needs the connection Upgrade headers preserved — Caddy's
+    # reverse_proxy handles WebSocket upgrades transparently, no special
+    # config required (unlike some ALB target-group health-check quirks the
+    # guide's own AWS path has to work around).
+    reverse_proxy gateway:8000
+
+    # uvicorn with --proxy-headers (see docker-compose.prod.yml) trusts
+    # X-Forwarded-For only from Caddy's own container — this header is what
+    # makes app/events.py's client_ip() see the real client, not Caddy's
+    # internal IP (REVISION #6, DECISIONS.md Phase 4a).
+    header_up X-Forwarded-For {remote_host}
+}
+
+# Grafana, self-hosted on the same VM (still free — the hybrid decision
+# moves Postgres to Neon and the dashboard to Vercel, not everything off
+# the VM). Separate subdomain so Caddy's automatic HTTPS issues it its own
+# cert without needing path-based routing rules.
+grafana.example.com {
+    reverse_proxy grafana:3000
+}

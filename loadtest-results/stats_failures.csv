@@ -1,0 +1,2 @@
+Method,Name,Error,Occurrences
+POST,/proxy/post,HTTPError('500 Server Error: Internal Server Error for url: /proxy/post'),2
