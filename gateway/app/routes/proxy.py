@@ -1,7 +1,7 @@
 import time
-import uuid
 
 import httpx
+import structlog
 from fastapi import APIRouter, Depends, Request, Response
 from redis.asyncio import Redis
 
@@ -12,7 +12,9 @@ from app.http_client import get_http_client
 from app.metrics import PROXY_LATENCY_MS, REQUESTS_TOTAL, status_class
 from app.middleware.rate_limit import enforce_rate_limit
 from app.redis_client import get_redis
-from app.tracing import tracer
+from app.tracing import current_traceparent, tracer
+
+logger = structlog.get_logger("shieldstream.proxy")
 
 router = APIRouter()
 
@@ -60,7 +62,7 @@ async def proxy(
     emit_event(  # fire-and-forget, deliberately NOT awaited — see event_emitter.py
         redis,
         RequestEvent(
-            request_id=str(uuid.uuid4()),
+            request_id=request.state.request_id,
             tenant_id=tenant["id"],
             endpoint=f"/proxy/{path}",
             method=request.method,
@@ -71,7 +73,15 @@ async def proxy(
             timestamp_ms=int(time.time() * 1000),
             query_string=str(request.url.query),
             user_agent=request.headers.get("user-agent", ""),
+            traceparent=current_traceparent(),
         ),
+    )
+    logger.info(
+        "proxy_request_completed",
+        tenant_id=tenant["id"],
+        endpoint=f"/proxy/{path}",
+        status_code=upstream_response.status_code,
+        latency_ms=latency_ms,
     )
 
     response = Response(

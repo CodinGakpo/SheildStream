@@ -17,6 +17,7 @@ class RequestEvent:
     timestamp_ms: int
     query_string: str = ""  # consumed by Week 8's OWASP rule engine
     user_agent: str = ""
+    traceparent: str = ""  # W3C trace context — Week 10 cross-process tracing
 
     def to_redis_fields(self) -> dict[str, str]:
         """XADD field values must be strings. Bool is serialized as "1"/"0"

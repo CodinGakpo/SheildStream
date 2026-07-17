@@ -22,10 +22,23 @@ import socket
 import time
 
 import asyncpg
+from prometheus_client import Gauge, start_http_server
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from analytics.aggregate import aggregate_by_bucket, parse_event
+from analytics.tracing import setup_tracing, span_for_event
+
+# Consumer lag (pending, unacked entries in this group) — the Grafana
+# dashboard's third panel (Week 10), and one of the blueprint's named alert
+# thresholds (lag > 5000). A gauge, not a counter: lag needs to go down as
+# well as up, and Prometheus scrapes it directly rather than the gateway
+# proxying it — this consumer is the only process that can cheaply answer
+# "how far behind is analytics-cg" via XPENDING's summary form.
+CONSUMER_LAG = Gauge(
+    "shieldstream_analytics_consumer_lag",
+    "Pending (delivered but not yet ACKed) entries in analytics-cg",
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("shieldstream.analytics")
@@ -170,6 +183,8 @@ async def adopt_orphaned_pending(redis: Redis, pool: asyncpg.Pool) -> None:
 
 
 async def run() -> None:
+    setup_tracing()
+    start_http_server(9100)  # scraped by Prometheus (docker-compose.yml)
     redis = Redis.from_url(REDIS_URL, decode_responses=True)
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await ensure_consumer_group(redis)
@@ -195,6 +210,14 @@ async def run() -> None:
                 event = parse_event(fields)
                 if event is not None:
                     batch.append(event)
+                    # A short span, not wrapping the actual DB write (which
+                    # happens later, batched, across many events at once) —
+                    # its purpose is purely to give this event's original
+                    # gateway trace a second span showing "the analytics
+                    # consumer saw this," continuing the same trace rather
+                    # than starting an unrelated one.
+                    with span_for_event(event.traceparent):
+                        pass
                 # Poison entries still get ACKed at flush time — see
                 # parse_event's docstring.
                 batch_ids.append(msg_id)
@@ -209,6 +232,8 @@ async def run() -> None:
 
         if time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
             await adopt_orphaned_pending(redis, pool)
+            summary = await redis.xpending(STREAM, GROUP)
+            CONSUMER_LAG.set(summary["pending"] if summary else 0)
             last_orphan_sweep = time.monotonic()
 
 

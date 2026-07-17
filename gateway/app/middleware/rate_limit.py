@@ -19,7 +19,6 @@ dependency declare it.
 
 import logging
 import time
-import uuid
 
 from fastapi import Depends, HTTPException, Request
 from redis.asyncio import Redis
@@ -34,7 +33,7 @@ from app.metrics import RATE_LIMIT_HITS_TOTAL, REQUESTS_TOTAL, status_class
 from app.policy import get_policy
 from app.rate_limiter import check_rate_limit
 from app.redis_client import get_redis
-from app.tracing import tracer
+from app.tracing import current_traceparent, tracer
 
 logger = logging.getLogger("shieldstream.ratelimit")
 
@@ -92,7 +91,7 @@ async def enforce_rate_limit(
         emit_event(
             redis,
             RequestEvent(
-                request_id=str(uuid.uuid4()),
+                request_id=request.state.request_id,
                 tenant_id=tenant["id"],
                 endpoint=route,
                 method=request.method,
@@ -103,6 +102,7 @@ async def enforce_rate_limit(
                 timestamp_ms=int(time.time() * 1000),
                 query_string=str(request.url.query),
                 user_agent=request.headers.get("user-agent", ""),
+                traceparent=current_traceparent(),
             ),
         )
         RATE_LIMIT_HITS_TOTAL.inc()

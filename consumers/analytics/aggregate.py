@@ -23,6 +23,7 @@ class ParsedEvent:
     latency_ms: float
     rate_limited: bool
     timestamp_ms: int
+    traceparent: str = ""  # Week 10 cross-process tracing; absent on pre-Week-10 events
 
 
 def parse_event(fields: dict[str, str]) -> ParsedEvent | None:
@@ -41,6 +42,7 @@ def parse_event(fields: dict[str, str]) -> ParsedEvent | None:
             latency_ms=float(fields["latency_ms"]),
             rate_limited=bool(int(fields["rate_limited"])),
             timestamp_ms=int(fields["timestamp_ms"]),
+            traceparent=fields.get("traceparent", ""),
         )
     except (KeyError, ValueError) as exc:
         logger.error("poison_event_dropped", exc_info=exc)

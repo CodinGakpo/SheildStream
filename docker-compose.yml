@@ -41,6 +41,33 @@ services:
     image: kennethreitz/httpbin
     ports: ["9000:80"]
 
+  # Week 10 observability. Scrapes the gateway's /metrics and the analytics
+  # consumer's :9100 (see consumers/analytics/worker.py's start_http_server)
+  # — the alert consumer has nothing to scrape, it only publishes to Pub/Sub.
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:z
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+
+  # Provisioned datasource/dashboard/alert-rule, not click-ops — see
+  # observability/grafana/provisioning/. Port 3001, not 3000: that's already
+  # the Next.js dashboard's dev server port.
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3001:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: localdev_only
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:z
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:z
+    depends_on:
+      - prometheus
+
   gateway:
     # network: host on the build (not the running container) works around this
     # machine's container-DNS breakage (container resolv.conf points at an
@@ -95,6 +122,7 @@ services:
       context: ./consumers
       network: host
     command: ["python", "-m", "analytics.worker"]
+    ports: ["9100:9100"]  # Prometheus scrape target — see prometheus.yml
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://shieldstream_worker:localdev_only@postgres:5432/shieldstream
@@ -102,6 +130,7 @@ services:
       # own PEL instantly on restart (see worker.py). A real multi-replica
       # deploy would derive this per-replica (e.g. from the task/pod id).
       CONSUMER_NAME: analytics-1
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       redis:
         condition: service_healthy

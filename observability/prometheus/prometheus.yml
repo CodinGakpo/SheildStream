@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: shieldstream-gateway
+    static_configs:
+      - targets: ["gateway:8000"]
+
+  # Consumer lag: only the analytics consumer exposes metrics — the alert
+  # consumer publishes to Pub/Sub, not Prometheus, and has nothing to scrape.
+  - job_name: shieldstream-analytics-consumer
+    static_configs:
+      - targets: ["analytics-consumer:9100"]
