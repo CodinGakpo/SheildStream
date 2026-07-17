@@ -14,7 +14,12 @@ services:
       POSTGRES_USER: shieldstream
       POSTGRES_PASSWORD: localdev_only
       POSTGRES_DB: shieldstream
-    ports: ["5432:5432"]
+    # Host port 5433, not 5432: this dev machine already has an unrelated
+    # project's Postgres bound to 5432. Containers still talk to each other
+    # over the internal Compose network as `postgres:5432` — only the
+    # host-side mapping (for e.g. a local, non-Compose psql/alembic run)
+    # changes.
+    ports: ["5433:5432"]
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -46,10 +51,18 @@ services:
     build:
       context: ./gateway
       network: host
-    ports: ["8000:8000"]
+    # A range, not a fixed 1:1 mapping: `docker compose up --scale gateway=N`
+    # needs N distinct host ports to bind to, and a fixed "8000:8000" can only
+    # ever satisfy one replica. With scale=1 (the default) Compose still just
+    # binds the first port in the range, so this is a no-op for every other
+    # command in this repo that assumes http://localhost:8000.
+    ports: ["8000-8005:8000"]
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://shieldstream_app:localdev_only@postgres:5432/shieldstream
+      # Week 9 admin API only — shieldstream_worker has UPDATE on policies,
+      # shieldstream_app (above) is deliberately SELECT-only under RLS.
+      ADMIN_DATABASE_URL: postgresql+asyncpg://shieldstream_worker:localdev_only@postgres:5432/shieldstream
       LOG_LEVEL: debug
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
@@ -58,10 +71,16 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      # :Z relabels the bind mount for exclusive container access under SELinux
-      # (Fedora enforces by default) — without it the container gets a silent
-      # Permission Denied reading a host-owned (user_home_t) directory.
-      - ./gateway/app:/app/app:Z
+      # :z (lowercase — shared), not :Z (exclusive): Week 9's --scale gateway=2
+      # test showed a second replica bind-mounting the same host directory
+      # with :Z fails to even import the app ("Could not import module
+      # app.main") — :Z grants relabeled access to exactly one container at a
+      # time, so a second concurrent reader gets shut out. :z relabels for
+      # shared read access across any number of containers, which is exactly
+      # what horizontally scaling this service needs; still relabeled (so no
+      # Permission Denied under Fedora's default SELinux enforcement), just
+      # not exclusively.
+      - ./gateway/app:/app/app:z
 
   # Analytics consumer: separate process from the gateway by design — a
   # stalled DB write must never compete with live proxied requests for the

@@ -50,6 +50,7 @@ GROUP = "alert-cg"
 CONSUMER_NAME = os.environ.get("CONSUMER_NAME") or socket.gethostname()
 
 ALERT_CHANNEL = "dashboard:alerts"
+METRICS_CHANNEL = "dashboard:metrics"  # Week 9: gateway WS dashboard's live RPS chart
 READ_COUNT = 200
 BLOCK_MS = 1000
 BASELINE_EVICT_EVERY_S = 300.0
@@ -109,8 +110,8 @@ async def drop_own_pending(redis: Redis) -> None:
         logger.info("dropped_stale_pending count=%d", total)
 
 
-async def _publish(redis: Redis, payload: dict) -> None:
-    await redis.publish(ALERT_CHANNEL, json.dumps(payload))
+async def _publish(redis: Redis, payload: dict, channel: str = ALERT_CHANNEL) -> None:
+    await redis.publish(channel, json.dumps(payload))
 
 
 async def process_message(redis: Redis, event: AlertEvent, rps_window: RollingRpsCounter) -> None:
@@ -132,8 +133,8 @@ async def process_message(redis: Redis, event: AlertEvent, rps_window: RollingRp
     rps_window.record(event.endpoint)
 
 
-async def score_baselines(redis: Redis, rps_window: RollingRpsCounter) -> None:
-    for endpoint, current_rps in rps_window.tick():
+async def score_baselines(redis: Redis, ticks: list[tuple[str, float]]) -> None:
+    for endpoint, current_rps in ticks:
         z = score_rps(endpoint, current_rps)
         if z is not None and z > Z_THRESHOLD:
             publish, count = should_publish("BEHAVIORAL_ANOMALY", endpoint)
@@ -146,6 +147,29 @@ async def score_baselines(redis: Redis, rps_window: RollingRpsCounter) -> None:
                     "current_rps": current_rps,
                     "count": count,
                 })
+
+
+async def publish_metric_snapshot(redis: Redis, ticks: list[tuple[str, float]]) -> None:
+    """Total RPS across all endpoints, published once per completed second so
+    the dashboard's live chart has something to render during quiet periods
+    with no alerts — alerts alone would leave the chart static except during
+    an actual attack.
+
+    Reuses this consumer's already-single-replica guarantee (rps_window.py's
+    per-endpoint baseline is only correct with one consumer seeing the whole
+    stream — see Week 8's DECISIONS.md entry) rather than adding separate
+    leader-election plumbing just to keep exactly one dashboard:metrics
+    publisher across gateway replicas. If the loop stalled across multiple
+    completed seconds, `ticks` bundles them together and this reports one
+    combined snapshot rather than one per second — the same accepted
+    multi-second-stall approximation already made for Tier 2 scoring above.
+    """
+    total_rps = sum(rps for _, rps in ticks)
+    await _publish(
+        redis,
+        {"type": "METRIC_SNAPSHOT", "rps": total_rps, "ts": time.time()},
+        channel=METRICS_CHANNEL,
+    )
 
 
 async def run() -> None:
@@ -175,10 +199,15 @@ async def run() -> None:
         if ack_ids:
             await redis.xack(STREAM, GROUP, *ack_ids)
 
-        # Once per loop tick (~1s via block): finalize completed RPS seconds
-        # and score them. Runs even when no new events arrived, so a traffic
-        # DROP to zero still produces a per-second sample.
-        await score_baselines(redis, rps_window)
+        # Once per loop tick (~1s via block): finalize completed RPS seconds,
+        # score them, and publish the dashboard's live RPS snapshot from the
+        # same drained ticks — tick() pops its buckets, so it's called once
+        # here and shared, not called again in each consumer separately.
+        # Runs even when no new events arrived, so a traffic DROP to zero
+        # still produces a per-second sample on both paths.
+        ticks = rps_window.tick()
+        await score_baselines(redis, ticks)
+        await publish_metric_snapshot(redis, ticks)
 
         if time.monotonic() - last_evict >= BASELINE_EVICT_EVERY_S:
             evicted = evict_idle()

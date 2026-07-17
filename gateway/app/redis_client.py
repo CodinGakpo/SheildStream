@@ -18,6 +18,20 @@ _redis: Redis = Redis.from_url(
     socket_timeout=0.2,
 )
 
+# A separate connection for long-lived Pub/Sub listeners (Week 9's policy
+# invalidation subscriber and dashboard WS fan-out) — pubsub.listen() blocks
+# on the socket waiting for the *next message*, which during a quiet period
+# can easily exceed the 0.2s timeout above and get mistaken for a dead
+# connection, spinning the reconnect loop continuously even though Redis is
+# perfectly healthy. That short timeout is deliberately tuned for the
+# request-path fail-open checks (see comment above); a subscriber needs a
+# connection that can sit idle indefinitely without erroring.
+_pubsub_redis: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
+
 
 async def get_redis() -> Redis:
     return _redis
+
+
+async def get_pubsub_redis() -> Redis:
+    return _pubsub_redis

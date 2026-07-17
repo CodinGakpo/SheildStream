@@ -7,6 +7,12 @@ from app.config import settings
 engine = create_async_engine(settings.database_url, pool_size=10, max_overflow=5)
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
+# Small dedicated pool for the low-volume admin API, connected as
+# shieldstream_worker (BYPASSRLS) rather than the tenant-facing
+# shieldstream_app — see app/config.py's admin_database_url comment.
+admin_engine = create_async_engine(settings.admin_database_url, pool_size=2, max_overflow=2)
+admin_session_factory = async_sessionmaker(admin_engine, expire_on_commit=False)
+
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency for routes that unconditionally need a DB session.
@@ -20,4 +26,9 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     `session_factory()` directly instead, only inside the cache-miss branch.
     """
     async with session_factory() as session:
+        yield session
+
+
+async def get_admin_db_session() -> AsyncGenerator[AsyncSession, None]:
+    async with admin_session_factory() as session:
         yield session

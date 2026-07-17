@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 MIGRATION_DATABASE_URL = os.environ.get(
     "MIGRATION_DATABASE_URL",
-    "postgresql+asyncpg://shieldstream:localdev_only@localhost:5432/shieldstream",
+    "postgresql+asyncpg://shieldstream:localdev_only@localhost:5433/shieldstream",
 )
 
 SEED_TENANTS = [

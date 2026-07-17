@@ -14,7 +14,7 @@ if config.config_file_name is not None:
 # (see revision #4 in DECISIONS.md — RLS is bypassable by the table owner).
 migration_url = os.environ.get(
     "MIGRATION_DATABASE_URL",
-    "postgresql://shieldstream:localdev_only@localhost:5432/shieldstream",
+    "postgresql://shieldstream:localdev_only@localhost:5433/shieldstream",
 )
 # Alembic uses the sync psycopg2 driver regardless of the app's asyncpg URL.
 migration_url = migration_url.replace("+asyncpg", "")
