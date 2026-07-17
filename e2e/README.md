@@ -9,15 +9,18 @@ can't catch things like a header the ASGI layer adds/drops only on a real
 HTTP response, or (later, Week 9+) a WebSocket handshake. This suite trades
 that speed for being a true consumer of the deployed stack.
 
-No browser is launched — these use Playwright's `request` fixture (API
-testing only), so there's no `playwright install` browser download step.
-That changes once the Week 9 dashboard exists and gets browser specs here.
+Most specs use Playwright's `request` fixture (API testing only, no browser).
+`dashboard_ws.spec.ts` is the exception (added Week 9): it drives a real
+Chromium `page` against the actual Next.js dashboard (`dashboard/`) as a
+true WebSocket client, since `request` has no WebSocket support.
 
 ## Prerequisites
 
 The full compose stack must be up (`docker compose up -d` from the repo
 root) — `gateway`, `postgres`, `redis`, and `httpbin` are all live-tested
-against.
+against. The dashboard's dev server is started automatically by
+`playwright.config.ts`'s `webServer` (reuses one you already have running
+via `npm run dev` in `dashboard/`, or starts one).
 
 ## Run
 

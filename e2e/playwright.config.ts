@@ -14,6 +14,17 @@ export default defineConfig({
   retries: 0,
   reporter: [["list"]],
   globalSetup: require.resolve("./global-setup"),
+  // Week 9's dashboard specs need the Next.js dev server running against the
+  // same compose stack the other specs already assume is up. `reuseExisting
+  // Server: true` means a manually-started `npm run dev` (common during
+  // active dashboard development) is left alone rather than double-started.
+  webServer: {
+    command: "npm run dev",
+    cwd: "../dashboard",
+    url: "http://localhost:3000",
+    reuseExistingServer: true,
+    timeout: 30_000,
+  },
   use: {
     baseURL: process.env.E2E_BASE_URL ?? "http://localhost:8000",
     // Chrome's Local Network Access checks (a page's origin connecting out to

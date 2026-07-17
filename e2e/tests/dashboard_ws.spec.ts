@@ -1,65 +1,68 @@
 import { expect, test } from "@playwright/test";
 import { E2E_TENANTS } from "../fixtures/tenants";
 
-// Week 9 Part B: the gateway's /ws/dashboard fans out two Redis Pub/Sub
-// channels — dashboard:alerts (Week 8 alert consumer) and dashboard:metrics
-// (this week's per-second RPS snapshot, published by the alert consumer,
-// see consumers/alerts/worker.py). This is the first spec in this suite
-// that needs a real browser: Playwright's `request` fixture is HTTP-only
-// and has no WebSocket support, so these use `page.evaluate` purely as a
-// WebSocket client harness — no dashboard UI is involved or required.
-const WS_URL = process.env.E2E_WS_URL ?? "ws://localhost:8000/ws/dashboard";
+// Week 9 Part C: now that the real Next.js dashboard exists (dashboard/),
+// these specs drive the actual UI instead of a raw WebSocket harness — per
+// this file's own prior comment ("changes once the Week 9 dashboard exists
+// and gets browser specs here"). The dashboard connects to the gateway's
+// /ws/dashboard fan-out, which multiplexes dashboard:alerts and
+// dashboard:metrics (see consumers/alerts/worker.py).
+const DASHBOARD_URL = process.env.E2E_DASHBOARD_URL ?? "http://localhost:3000";
 
-test("dashboard WS receives periodic METRIC_SNAPSHOT frames", async ({ page }) => {
-  await page.goto("about:blank");
-  const messages = await page.evaluate(
-    (wsUrl) =>
-      new Promise<string[]>((resolve, reject) => {
-        const socket = new WebSocket(wsUrl);
-        const received: string[] = [];
-        socket.onmessage = (evt) => received.push(evt.data);
-        socket.onerror = () => reject(new Error("websocket error"));
-        setTimeout(() => {
-          socket.close();
-          resolve(received);
-        }, 3000);
-      }),
-    WS_URL,
-  );
+test("dashboard connects and the RPS chart populates from METRIC_SNAPSHOT frames", async ({
+  page,
+}) => {
+  await page.goto(DASHBOARD_URL);
 
-  const snapshots = messages.map((m) => JSON.parse(m)).filter((m) => m.type === "METRIC_SNAPSHOT");
+  await expect(page.getByTestId("connection-status")).toHaveAttribute("data-status", "open", {
+    timeout: 5000,
+  });
+
   // Published roughly once per second by the alert consumer's loop tick —
-  // a 3s window should reliably catch at least one, usually two or three.
-  expect(snapshots.length).toBeGreaterThan(0);
+  // the "waiting for first snapshot" placeholder should be gone well within
+  // a few seconds of connecting.
+  await expect(page.getByText("Waiting for first metric snapshot")).toHaveCount(0, {
+    timeout: 5000,
+  });
 });
 
-test("an injected SQLi request produces a THREAT_DETECTED alert on the WS within ~2s", async ({
+test("an injected SQLi request produces a HIGH-severity alert in the threat feed within ~2s", async ({
   page,
   request,
 }) => {
-  await page.goto("about:blank");
-  await page.evaluate(
-    (wsUrl) =>
-      new Promise<void>((resolve, reject) => {
-        const socket = new WebSocket(wsUrl);
-        (window as unknown as { __wsMessages: string[] }).__wsMessages = [];
-        socket.onopen = () => resolve();
-        socket.onmessage = (evt) =>
-          (window as unknown as { __wsMessages: string[] }).__wsMessages.push(evt.data);
-        socket.onerror = () => reject(new Error("websocket error"));
-      }),
-    WS_URL,
-  );
+  await page.goto(DASHBOARD_URL);
+  await expect(page.getByTestId("connection-status")).toHaveAttribute("data-status", "open", {
+    timeout: 5000,
+  });
 
-  await request.get("/proxy/get", {
+  await request.get("http://localhost:8000/proxy/get", {
     params: { q: "' OR 1=1--" },
     headers: { "X-API-Key": E2E_TENANTS.auth.apiKey },
   });
 
-  await page.waitForTimeout(2000);
-  const raw = await page.evaluate(
-    () => (window as unknown as { __wsMessages: string[] }).__wsMessages,
-  );
-  const alerts = raw.map((m) => JSON.parse(m)).filter((m) => m.type === "THREAT_DETECTED");
-  expect(alerts.length).toBeGreaterThan(0);
+  const feedItem = page.getByText(/SQLI on/i).first();
+  await expect(feedItem).toBeVisible({ timeout: 3000 });
+
+  const container = page.locator("li", { has: feedItem });
+  await expect(container.getByText("HIGH")).toBeVisible();
+});
+
+test("gateway restart: dashboard shows reconnecting then recovers without a page reload", async ({
+  page,
+}) => {
+  test.setTimeout(30_000);
+  await page.goto(DASHBOARD_URL);
+  await expect(page.getByTestId("connection-status")).toHaveAttribute("data-status", "open", {
+    timeout: 5000,
+  });
+
+  const { execSync } = require("child_process");
+  execSync("docker compose restart gateway", { cwd: "../" });
+
+  await expect(page.getByTestId("connection-status")).toHaveAttribute("data-status", "reconnecting", {
+    timeout: 10_000,
+  });
+  await expect(page.getByTestId("connection-status")).toHaveAttribute("data-status", "open", {
+    timeout: 20_000,
+  });
 });

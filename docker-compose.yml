@@ -51,12 +51,16 @@ services:
     build:
       context: ./gateway
       network: host
-    # A range, not a fixed 1:1 mapping: `docker compose up --scale gateway=N`
-    # needs N distinct host ports to bind to, and a fixed "8000:8000" can only
-    # ever satisfy one replica. With scale=1 (the default) Compose still just
-    # binds the first port in the range, so this is a no-op for every other
-    # command in this repo that assumes http://localhost:8000.
-    ports: ["8000-8005:8000"]
+    # Fixed 1:1 mapping. A range ("8000-8005:8000") was used transiently for
+    # the Week 9 multi-replica fan-out verification (`--scale gateway=N`
+    # needs N distinct host ports) — but Docker's range allocator turned out
+    # to use a forward-only cursor, not "lowest free port": after that
+    # scaling test, repeated `stop/rm/up` cycles kept climbing to 8001, 8002,
+    # ... even though the OS-level socket for 8000 was confirmed free each
+    # time. A fixed mapping sidesteps the allocator's range-cursor state
+    # entirely. If horizontal scaling needs live-testing again, temporarily
+    # widen this back to a range.
+    ports: ["8000:8000"]
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://shieldstream_app:localdev_only@postgres:5432/shieldstream
@@ -104,7 +108,13 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./consumers:/app:Z
+      # :z (shared), not :Z (exclusive) — this directory is concurrently
+      # bind-mounted by alert-consumer too. Two :Z mounts of the same host
+      # path race on SELinux relabeling; on a cold `docker compose up -d`
+      # this manifested as alert-consumer failing to start with
+      # "ModuleNotFoundError: No module named 'alerts'" (same bug class as
+      # the gateway's Week 9 :Z→:z fix, see below).
+      - ./consumers:/app:z
 
   # Alert consumer: the second independent reader of request_events, via its
   # own consumer group (alert-cg), structurally decoupled from analytics-cg.
@@ -125,7 +135,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./consumers:/app:Z
+      - ./consumers:/app:z
 
   # One-off tooling container for Alembic migrations / seed script — run via
   # `docker compose run --rm migrate alembic upgrade head` (see README).
